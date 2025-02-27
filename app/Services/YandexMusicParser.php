@@ -29,11 +29,15 @@ class YandexMusicParser
      */
     private function fetchHtml(string $url): string
     {
-        $response = $this->client->get($url);
-        if ($response->getStatusCode() !== 200) {
-            throw new \Exception('Failed to fetch data from Yandex Music.');
+        try {
+            $response = $this->client->get($url);
+            if ($response->getStatusCode() !== 200) {
+                throw new \Exception('Failed to fetch data from Yandex Music: HTTP ' . $response->getStatusCode());
+            }
+            return $response->getBody()->getContents();
+        } catch (\Exception $e) {
+            throw new \Exception('Error fetching HTML: ' . $e->getMessage());
         }
-        return $response->getBody()->getContents();
     }
 
     /**
@@ -45,51 +49,59 @@ class YandexMusicParser
      */
     public function parseArtist(int $artistId): array
     {
-        // Fetch artist's tracks page and albums page separately
-        $artistPageHtml = $this->fetchHtml("https://music.yandex.ru/artist/{$artistId}/tracks");
-        $albumsPageHtml = $this->fetchHtml("https://music.yandex.ru/artist/{$artistId}/albums");
-        
-        // Load HTML into DOM objects for parsing
-        $artistDom = new DOMDocument();
-        @$artistDom->loadHTML($artistPageHtml);
-        $artistXpath = new DOMXPath($artistDom);
-        
-        $albumsDom = new DOMDocument();
-        @$albumsDom->loadHTML($albumsPageHtml);
-        $albumsXpath = new DOMXPath($albumsDom);
+        try {
+            // Fetch artist's tracks page and albums page separately
+            $artistPageHtml = $this->fetchHtml("https://music.yandex.ru/artist/{$artistId}/tracks");
+            $albumsPageHtml = $this->fetchHtml("https://music.yandex.ru/artist/{$artistId}/albums");
 
-        // Extract artist details
-        $artistName = $this->extractArtistName($artistXpath);
-        $subscribers = $this->extractSubscribers($artistXpath);
-        $monthlyListeners = $this->extractMonthlyListeners($artistXpath);
-        $albumsCount = $this->extractAlbumsCount($albumsXpath);
+            // Load HTML into DOM objects for parsing
+            $artistDom = new DOMDocument();
+            @$artistDom->loadHTML($artistPageHtml);
+            $artistXpath = new DOMXPath($artistDom);
 
-        // Save artist data in the database
-        $artist = Artist::firstOrCreate(
-            ['name' => $artistName],
-            [
-                'subscribers_count' => $subscribers,
-                'monthly_listeners' => $monthlyListeners,
-                'albums_count' => $albumsCount
-            ]
-        );
+            $albumsDom = new DOMDocument();
+            @$albumsDom->loadHTML($albumsPageHtml);
+            $albumsXpath = new DOMXPath($albumsDom);
 
-        // Extract and save tracks
-        $tracks = $this->extractTracks($artistXpath);
-        foreach ($tracks as $track) {
-            Track::firstOrCreate(
-                ['name' => $track['name'], 'artist_id' => $artist->id],
-                ['duration' => $track['duration']]
+            // Extract artist details
+            $artistName = $this->extractArtistName($artistXpath);
+            if ($artistName === 'Unknown Artist') {
+                throw new \Exception('Artist not found or invalid artist ID.');
+            }
+
+            $subscribers = $this->extractSubscribers($artistXpath);
+            $monthlyListeners = $this->extractMonthlyListeners($artistXpath);
+            $albumsCount = $this->extractAlbumsCount($albumsXpath);
+
+            // Save or update artist data in the database
+            $artist = Artist::updateOrCreate(
+                ['name' => $artistName],
+                [
+                    'subscribers_count' => $subscribers,
+                    'monthly_listeners' => $monthlyListeners,
+                    'albums_count' => $albumsCount
+                ]
             );
-        }
 
-        return [
-            'artist' => $artistName,
-            'subscribers' => $subscribers,
-            'monthly_listeners' => $monthlyListeners,
-            'albums_count' => $albumsCount,
-            'tracks' => count($tracks)
-        ];
+            // Extract and save or update tracks
+            $tracks = $this->extractTracks($artistXpath);
+            foreach ($tracks as $track) {
+                Track::updateOrCreate(
+                    ['name' => $track['name'], 'artist_id' => $artist->id],
+                    ['duration' => $track['duration']]
+                );
+            }
+
+            return [
+                'artist' => $artistName,
+                'subscribers' => $subscribers,
+                'monthly_listeners' => $monthlyListeners,
+                'albums_count' => $albumsCount,
+                'tracks' => count($tracks)
+            ];
+        } catch (\Exception $e) {
+            throw new \Exception('Error parsing artist: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -112,7 +124,7 @@ class YandexMusicParser
      */
     private function extractSubscribers(DOMXPath $xpath): int
     {
-        $node = $xpath->query("//span[contains(@class, 'd-like_theme-count')]/span[contains(@class, 'd-button__label')]");
+        $node = $xpath->query("//span[contains(@class, 'd-like_theme-count')]");
         return $node->length ? (int)filter_var($node->item(0)->nodeValue, FILTER_SANITIZE_NUMBER_INT) : 0;
     }
 
@@ -141,7 +153,7 @@ class YandexMusicParser
     }
 
     /**
-     * Extracts track names and durations.
+     * Extracts track names and durations from the artist's tracks page.
      *
      * @param DOMXPath $xpath The XPath object for parsing.
      * @return array An array of tracks with names and durations.
@@ -153,11 +165,17 @@ class YandexMusicParser
 
         $tracks = [];
         foreach ($trackNodes as $index => $trackNode) {
+            // Extract track name
             $name = trim($trackNode->nodeValue);
+
+            // Extract and calculate track duration
             $durationParts = explode(':', trim($durationNodes->item($index)->nodeValue ?? '0:00'));
             $duration = ((int)$durationParts[0] * 60) + (int)$durationParts[1];
+
+            // Append track data to the tracks array
             $tracks[] = ['name' => $name, 'duration' => $duration];
         }
+
         return $tracks;
     }
 }
